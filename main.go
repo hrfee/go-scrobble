@@ -27,7 +27,9 @@ var (
 type trackDetails struct {
 	playerName, title, artist, albumArtist, album string
 	trackNumber                                   int
+	length                                        int
 	playing                                       bool
+	started                                       time.Time
 }
 
 func stripFeatures(s string) string {
@@ -37,9 +39,8 @@ func stripFeatures(s string) string {
 		if i != -1 {
 			if s[i-1] == ' ' {
 				return s[:i-1]
-			} else {
-				return s[:i]
 			}
+			return s[:i]
 		}
 	}
 	return s
@@ -53,10 +54,22 @@ func (t *trackDetails) update(p *mpris2.Player) {
 	t.album = p.Album
 	t.trackNumber = p.TrackNumber
 	t.playing = p.Playing
+	t.length = p.Length
 }
 
 func (t *trackDetails) equals(o trackDetails) bool {
 	return t.title == o.title && t.artist == o.artist && t.albumArtist == o.albumArtist && t.album == o.album
+}
+
+func (t *trackDetails) isDuplicateScrobble(o trackDetails) bool {
+	if !t.equals(o) {
+		return false
+	}
+	// If the new scrobble started after the calculated end time of the last scrobble, its not a duplicate
+	if t.started.After(o.started.Add(time.Duration(o.length) * time.Second)) {
+		return false
+	}
+	return true
 }
 
 func genParams(p *mpris2.Player) (map[string]interface{}, bool) {
@@ -187,6 +200,7 @@ func main() {
 	players.Sort()
 	last := trackDetails{}
 	now := trackDetails{}
+	lastScrobbled := trackDetails{}
 	go players.Listen()
 	for v := range players.Messages {
 		if v.Name == "refresh" {
@@ -213,7 +227,8 @@ func main() {
 					go func(p *mpris2.Player, details trackDetails, params map[string]interface{}) {
 						currentDetails := trackDetails{}
 						pos := int(p.Position / 1000000)
-						params["timestamp"] = time.Now().Add(time.Duration(-pos) * time.Second).Unix()
+						ts := time.Now().Add(time.Duration(-pos) * time.Second)
+						params["timestamp"] = ts.Unix()
 						for {
 							time.Sleep(time.Duration(poll) * time.Second)
 							pos += poll
@@ -232,6 +247,10 @@ func main() {
 								return
 							}
 							if validScrobble(p) {
+								details.started = ts
+								if details.isDuplicateScrobble(lastScrobbled) {
+									return
+								}
 								res, err := api.Track.Scrobble(params)
 								msg := serverResponse(res, err)
 								if err != nil {
@@ -243,6 +262,7 @@ func main() {
 								if debug {
 									log.Println("Scrobbled: ", msg)
 								}
+								lastScrobbled = details
 								return
 							}
 						}
