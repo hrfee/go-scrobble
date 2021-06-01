@@ -119,39 +119,66 @@ func setKey(config *ini.File, section, key, value, comment string) {
 	config.Section(section).Key(key).Comment = comment
 }
 
+func genDefaultConfig() {
+	dir, _ := filepath.Split(configFile)
+	os.MkdirAll(dir, os.FileMode(0700))
+	f, err := os.Create(configFile)
+	if err != nil {
+		log.Fatalf("Failed to create new config at \"%s\"", configFile)
+	}
+	f.Close()
+	tempConfig, err := ini.Load(configFile)
+	if err != nil {
+		log.Fatalf("Failed to create new config at \"%s\"", configFile)
+	}
+	setKey(tempConfig, "api", "key", "", "Last.FM API Key and Secret. Generate at https://www.last.fm/api/account/create")
+	setKey(tempConfig, "api", "secret", "", "")
+	setKey(tempConfig, "general", "poll-rate", "1", "How often per second to poll for track position. You can probably leave this alone.")
+	setKey(tempConfig, "general", "strip-features", "true", "Strip features (e.g (feat. X)) from track name and artist before sending to server. This may lead to better matches.")
+	err = tempConfig.SaveTo(configFile)
+	if err != nil {
+		log.Fatalf("Failed to save template config at \"%s\"", configFile)
+	}
+	fmt.Printf("Saved template config at \"%s\". You'll need to fill in the API key and Secret. Generate these now? [yY/nN]\n>: ", configFile)
+	choice := ""
+	fmt.Scanln(&choice)
+	if strings.ToLower(choice) == "y" {
+		url := "https://www.last.fm/api/account/create"
+		browser.OpenURL(url)
+		fmt.Printf("%s\nFill in the form (Details are unimportant) then add the key/secret to the config file.\n", url)
+	}
+}
+
+func getSessionKey(api *lastfm.Api, config *ini.File) (sessionKey string) {
+	token, err := api.GetToken()
+	if err != nil {
+		log.Fatalln("Couldn't get token from Last.FM:", err)
+	}
+	url := api.GetAuthTokenUrl(token)
+	browser.OpenURL(url)
+	fmt.Printf("%s\nAuthorize and then press Enter to continue.\n>: ", url)
+	fmt.Scanln()
+	err = api.LoginWithToken(token)
+	if err != nil {
+		log.Fatalln("Couldn't login:", err)
+	}
+	sessionKey = api.GetSessionKey()
+	config.Section("api").Key("sk").SetValue(sessionKey)
+	err = config.SaveTo(configFile)
+	if err != nil {
+		log.Fatalln("Failed to write config file:", err)
+	}
+	fmt.Printf("Your session key was added to \"%s\". Reauthorization is necessary if lost.\n", configFile)
+	return
+}
+
 func main() {
 	flag.BoolVar(&debug, "debug", debug, "Debug logging.")
 	flag.StringVar(&configFile, "config", configFile, "Path to config file")
 	flag.Parse()
 
 	if _, err := os.Stat(configFile); os.IsNotExist(err) {
-		dir, _ := filepath.Split(configFile)
-		os.MkdirAll(dir, os.FileMode(0700))
-		f, err := os.Create(configFile)
-		if err != nil {
-			log.Fatalf("Failed to create new config at \"%s\"", configFile)
-		}
-		f.Close()
-		tempConfig, err := ini.Load(configFile)
-		if err != nil {
-			log.Fatalf("Failed to create new config at \"%s\"", configFile)
-		}
-		setKey(tempConfig, "api", "key", "", "Last.FM API Key and Secret. Generate at https://www.last.fm/api/account/create")
-		setKey(tempConfig, "api", "secret", "", "")
-		setKey(tempConfig, "general", "poll-rate", "1", "How often per second to poll for track position. You can probably leave this alone.")
-		setKey(tempConfig, "general", "strip-features", "true", "Strip features (e.g (feat. X)) from track name and artist before sending to server. This may lead to better matches.")
-		err = tempConfig.SaveTo(configFile)
-		if err != nil {
-			log.Fatalf("Failed to save template config at \"%s\"", configFile)
-		}
-		fmt.Printf("Saved template config at \"%s\". You'll need to fill in the API key and Secret. Generate these now? [yY/nN]\n>: ", configFile)
-		choice := ""
-		fmt.Scanln(&choice)
-		if strings.ToLower(choice) == "y" {
-			url := "https://www.last.fm/api/account/create"
-			browser.OpenURL(url)
-			fmt.Println("%s\nFill in the form (Details are unimportant) then add the key/secret to the config file.\n", url)
-		}
+		genDefaultConfig()
 		return
 	}
 	config, err := ini.Load(configFile)
@@ -169,25 +196,7 @@ func main() {
 	api := lastfm.New(key, secret)
 	sessionKey := config.Section("api").Key("sk").MustString("")
 	if sessionKey == "" {
-		token, err := api.GetToken()
-		if err != nil {
-			log.Fatalln("Couldn't get token from Last.FM:", err)
-		}
-		url := api.GetAuthTokenUrl(token)
-		browser.OpenURL(url)
-		fmt.Printf("%s\nAuthorize and then press Enter to continue.\n>: ", url)
-		fmt.Scanln()
-		err = api.LoginWithToken(token)
-		if err != nil {
-			log.Fatalln("Couldn't login:", err)
-		}
-		sessionKey = api.GetSessionKey()
-		config.Section("api").Key("sk").SetValue(sessionKey)
-		err = config.SaveTo(configFile)
-		if err != nil {
-			log.Fatalln("Failed to write config file:", err)
-		}
-		fmt.Printf("Your session key was added to \"%s\". Reauthorization is necessary if lost.\n", configFile)
+		sessionKey = getSessionKey(api, config)
 	}
 	api.SetSession(sessionKey)
 	conn, err := dbus.SessionBus()
@@ -203,73 +212,76 @@ func main() {
 	lastScrobbled := trackDetails{}
 	go players.Listen()
 	for v := range players.Messages {
-		if v.Name == "refresh" {
-			players.Sort()
-			player := players.List[players.Current]
-			now.update(player)
-			if !now.equals(last) {
-				last = now
-				if player.Playing {
-					params, ok := genParams(player)
-					if !ok {
-						if debug {
-							log.Println("Ignoring due to missing metadata")
-						}
-						continue
-					}
-					res, err := api.Track.UpdateNowPlaying(params)
-					if err == nil {
-						log.Println("Now Playing: " + playerInfo(player))
-					}
-					if debug {
-						log.Println(serverResponse(res, err))
-					}
-					go func(p *mpris2.Player, details trackDetails, params map[string]interface{}) {
-						currentDetails := trackDetails{}
-						pos := int(p.Position / 1000000)
-						ts := time.Now().Add(time.Duration(-pos) * time.Second)
-						params["timestamp"] = ts.Unix()
-						for {
-							time.Sleep(time.Duration(poll) * time.Second)
-							pos += poll
-							if !p.Exists() {
-								fmt.Println("exist")
-								return
-							}
-							p.GetPosition()
-							p.Refresh()
-							if !withinTimeRange(pos, int(p.Position/1000000)) {
-								fmt.Println("timerange", pos, int(p.Position/1000000))
-								return
-							}
-							currentDetails.update(p)
-							if !details.equals(currentDetails) {
-								return
-							}
-							if validScrobble(p) {
-								details.started = ts
-								if details.isDuplicateScrobble(lastScrobbled) {
-									return
-								}
-								res, err := api.Track.Scrobble(params)
-								msg := serverResponse(res, err)
-								if err != nil {
-									log.Println("Failed to scrobble: ", msg)
-								}
-								if res.Ignored == "1" {
-									log.Println("Server ignored scrobble: ", msg)
-								}
-								if debug {
-									log.Println("Scrobbled: ", msg)
-								}
-								lastScrobbled = details
-								return
-							}
-						}
-					}(player, now, params)
-				}
-
-			}
+		if v.Name != "refresh" {
+			continue
 		}
+		players.Sort()
+		player := players.List[players.Current]
+		now.update(player)
+		if now.equals(last) {
+			continue
+		}
+		last = now
+		if !player.Playing {
+			continue
+		}
+		params, ok := genParams(player)
+		if !ok {
+			if debug {
+				log.Println("Ignoring due to missing metadata")
+			}
+			continue
+		}
+		res, err := api.Track.UpdateNowPlaying(params)
+		if err == nil {
+			log.Println("Now Playing: " + playerInfo(player))
+		}
+		if debug {
+			log.Println(serverResponse(res, err))
+		}
+		go func(p *mpris2.Player, details trackDetails, params map[string]interface{}) {
+			currentDetails := trackDetails{}
+			pos := int(p.Position / 1000000)
+			ts := time.Now().Add(time.Duration(-pos) * time.Second)
+			params["timestamp"] = ts.Unix()
+			for {
+				time.Sleep(time.Duration(poll) * time.Second)
+				pos += poll
+				if !p.Exists() {
+					fmt.Println("exist")
+					return
+				}
+				p.GetPosition()
+				p.Refresh()
+				if !withinTimeRange(pos, int(p.Position/1000000)) {
+					fmt.Println("timerange", pos, int(p.Position/1000000))
+					return
+				}
+				currentDetails.update(p)
+				if !details.equals(currentDetails) {
+					return
+				}
+				if !validScrobble(p) {
+					continue
+				}
+				details.started = ts
+				if details.isDuplicateScrobble(lastScrobbled) {
+					return
+				}
+				res, err := api.Track.Scrobble(params)
+				msg := serverResponse(res, err)
+				if err != nil {
+					log.Println("Failed to scrobble: ", msg)
+				}
+				if res.Ignored == "1" {
+					log.Println("Server ignored scrobble: ", msg)
+				}
+				if debug {
+					log.Println("Scrobbled: ", msg)
+				}
+				lastScrobbled = details
+				return
+			}
+		}(player, now, params)
 	}
 }
