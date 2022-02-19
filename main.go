@@ -135,6 +135,7 @@ func genDefaultConfig() {
 	setKey(tempConfig, "api", "secret", "", "")
 	setKey(tempConfig, "general", "poll-rate", "1", "How often per second to poll for track position. You can probably leave this alone.")
 	setKey(tempConfig, "general", "strip-features", "true", "Strip features (e.g (feat. X)) from track name and artist before sending to server. This may lead to better matches.")
+	setKey(tempConfig, "general", "ignore", "", "comma separated list of case-insensitive player names to ignore for scrobbling.")
 	err = tempConfig.SaveTo(configFile)
 	if err != nil {
 		log.Fatalf("Failed to save template config at \"%s\"", configFile)
@@ -187,6 +188,10 @@ func main() {
 	}
 	poll = config.Section("general").Key("poll-rate").MustInt(poll)
 	stripFeat = config.Section("general").Key("strip-features").MustBool(stripFeat)
+	ignore := strings.Split(config.Section("general").Key("ignore").String(), ",")
+	for i := range ignore {
+		ignore[i] = strings.ToLower(ignore[i])
+	}
 
 	key := config.Section("api").Key("key").MustString("")
 	secret := config.Section("api").Key("secret").MustString("")
@@ -223,6 +228,19 @@ func main() {
 		}
 		last = now
 		if !player.Playing {
+			continue
+		}
+		shouldIgnore := false
+		for _, name := range ignore {
+			if strings.Contains(strings.ToLower(player.Name), name) {
+				shouldIgnore = true
+				if debug {
+					log.Printf("Ignoring player \"%s\"", player.Name)
+				}
+				break
+			}
+		}
+		if shouldIgnore {
 			continue
 		}
 		params, ok := genParams(player)
