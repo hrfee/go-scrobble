@@ -1,24 +1,31 @@
-### go-scrobble
+### go-scrobble-mpd
 
-An ugly little MPRIS2 scrobbler for last.FM. mpris-scrobbler seemed to rarely work, and my music library naming means tracks with features in the title or artist aren't properly matched. This switches to the currently playing player automatically and strips features (optional). Uses [lastfm-go](https://github.com/shkh/lastfm-go).
+Same as normal go-scrobble but directly interacts with MPD only.
 
-The XESAM Ontology was very useful when making this, but the archive i found was super slow. I've put up a simple one [here](https://xesam.hrfee.dev) if anyone wants it.
 
 ```bash
-$ go get github.com/hrfee/go-scrobble
+$ go get github.com/hrfee/go-scrobble@mpd
 
 $ go-scrobble -help
 Usage of go-scrobble:
   -config string
-    	Path to config file (default "~/.config/go-scrobble.ini")
+    	Path to config file (default "~/.config/go-scrobble-mpd.ini")
   -debug
     	Debug logging.
 ```
 
 ```ini
+[mpd]
+; Connection protocol. should be tcp or unix.
+protocol = tcp
+; Address of MPD.
+address  = localhost:6600
+; optional MPD password.
+password = 
+
 [api]
 ; Last.FM API Key and Secret. Generate at https://www.last.fm/api/account/create
-key    = 
+key    =
 secret = 
 
 [general]

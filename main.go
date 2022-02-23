@@ -10,26 +10,25 @@ import (
 	"time"
 
 	"github.com/adrg/xdg"
-	"github.com/godbus/dbus/v5"
-	mpris2 "github.com/hrfee/mpris2client"
+	mpd "github.com/hrfee/go-scrobble/mpdclient"
 	"github.com/pkg/browser"
 	"github.com/shkh/lastfm-go/lastfm"
 	"gopkg.in/ini.v1"
 )
 
 var (
-	configFile = filepath.Join(xdg.ConfigHome, "go-scrobble.ini")
+	configFile = filepath.Join(xdg.ConfigHome, "go-scrobble-mpd.ini")
 	poll       = 1
 	debug      = false
 	stripFeat  = false
 )
 
 type trackDetails struct {
-	playerName, title, artist, albumArtist, album string
-	trackNumber                                   int
-	length                                        int
-	playing                                       bool
-	started                                       time.Time
+	title, artist, albumArtist, album string
+	trackNumber                       int
+	length                            int
+	playing                           bool
+	started                           time.Time
 }
 
 func stripFeatures(s string) string {
@@ -46,8 +45,7 @@ func stripFeatures(s string) string {
 	return s
 }
 
-func (t *trackDetails) update(p *mpris2.Player) {
-	t.playerName = p.Name
+func (t *trackDetails) update(p *mpd.Player) {
 	t.title = p.Title
 	t.artist = p.Artist
 	t.albumArtist = p.AlbumArtist
@@ -72,7 +70,7 @@ func (t *trackDetails) isDuplicateScrobble(o trackDetails) bool {
 	return true
 }
 
-func genParams(p *mpris2.Player) (map[string]interface{}, bool) {
+func genParams(p *mpd.Player) (map[string]interface{}, bool) {
 	if p.Title == "" || p.Artist == "" || p.Album == "" {
 		return nil, false
 	}
@@ -97,7 +95,7 @@ func genParams(p *mpris2.Player) (map[string]interface{}, bool) {
 	return params, true
 }
 
-func validScrobble(p *mpris2.Player) bool {
+func validScrobble(p *mpd.Player) bool {
 	pos := int(p.Position / 1000000)
 	return ((float64(pos) / float64(p.Length)) > 0.5) || pos > 4*60
 }
@@ -106,8 +104,8 @@ func withinTimeRange(calculated int, actual int) bool {
 	return actual > (calculated-5) || actual < (calculated+5)
 }
 
-func playerInfo(p *mpris2.Player) string {
-	return fmt.Sprintf("Player: %s, Track: %s, Artist: %s, Album: %s", p.Name, p.Title, p.Artist, p.Album)
+func playerInfo(p *mpd.Player) string {
+	return fmt.Sprintf("Track: %s, Artist: %s, Album: %s", p.Title, p.Artist, p.Album)
 }
 
 func serverResponse(res interface{}, err error) string {
@@ -131,11 +129,13 @@ func genDefaultConfig() {
 	if err != nil {
 		log.Fatalf("Failed to create new config at \"%s\"", configFile)
 	}
+	setKey(tempConfig, "mpd", "protocol", "tcp", "Connection protocol. should be tcp or unix.")
+	setKey(tempConfig, "mpd", "address", "localhost:6600", "Address of MPD.")
+	setKey(tempConfig, "mpd", "password", "", "optional MPD password.")
 	setKey(tempConfig, "api", "key", "", "Last.FM API Key and Secret. Generate at https://www.last.fm/api/account/create")
 	setKey(tempConfig, "api", "secret", "", "")
 	setKey(tempConfig, "general", "poll-rate", "1", "How often per second to poll for track position. You can probably leave this alone.")
 	setKey(tempConfig, "general", "strip-features", "true", "Strip features (e.g (feat. X)) from track name and artist before sending to server. This may lead to better matches.")
-	setKey(tempConfig, "general", "ignore", "", "comma separated list of case-insensitive player names to ignore for scrobbling.")
 	err = tempConfig.SaveTo(configFile)
 	if err != nil {
 		log.Fatalf("Failed to save template config at \"%s\"", configFile)
@@ -188,10 +188,6 @@ func main() {
 	}
 	poll = config.Section("general").Key("poll-rate").MustInt(poll)
 	stripFeat = config.Section("general").Key("strip-features").MustBool(stripFeat)
-	ignore := strings.Split(config.Section("general").Key("ignore").String(), ",")
-	for i := range ignore {
-		ignore[i] = strings.ToLower(ignore[i])
-	}
 
 	key := config.Section("api").Key("key").MustString("")
 	secret := config.Section("api").Key("secret").MustString("")
@@ -204,43 +200,29 @@ func main() {
 		sessionKey = getSessionKey(api, config)
 	}
 	api.SetSession(sessionKey)
-	conn, err := dbus.SessionBus()
-	if err != nil {
-		log.Fatalln("Error connecting to DBus:", err)
-	}
-	players := mpris2.NewMpris2(conn, false, poll, true)
 
-	players.Reload()
-	players.Sort()
+	protocol := config.Section("mpd").Key("protocol").MustString("tcp")
+	address := config.Section("mpd").Key("address").MustString("localhost:6600")
+	password := config.Section("mpd").Key("password").String()
+	player, err := mpd.NewPlayer(protocol, address, password, poll)
+	if err != nil {
+		log.Fatalf("Failed to connect to MPD: %v", err)
+	}
+
 	last := trackDetails{}
 	now := trackDetails{}
 	lastScrobbled := trackDetails{}
-	go players.Listen()
-	for v := range players.Messages {
+	go player.Listen()
+	for v := range player.Messages {
 		if v.Name != "refresh" {
 			continue
 		}
-		players.Sort()
-		player := players.List[players.Current]
 		now.update(player)
 		if now.equals(last) {
 			continue
 		}
 		last = now
 		if !player.Playing {
-			continue
-		}
-		shouldIgnore := false
-		for _, name := range ignore {
-			if strings.Contains(strings.ToLower(player.Name), name) {
-				shouldIgnore = true
-				if debug {
-					log.Printf("Ignoring player \"%s\"", player.Name)
-				}
-				break
-			}
-		}
-		if shouldIgnore {
 			continue
 		}
 		params, ok := genParams(player)
@@ -257,7 +239,7 @@ func main() {
 		if debug {
 			log.Println(serverResponse(res, err))
 		}
-		go func(p *mpris2.Player, details trackDetails, params map[string]interface{}) {
+		go func(p *mpd.Player, details trackDetails, params map[string]interface{}) {
 			currentDetails := trackDetails{}
 			pos := int(p.Position / 1000000)
 			ts := time.Now().Add(time.Duration(-pos) * time.Second)
